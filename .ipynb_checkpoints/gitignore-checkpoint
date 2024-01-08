@@ -1,0 +1,5 @@
+wandb/
+test00/
+latest_cm.csv
+checkpoints/
+data
