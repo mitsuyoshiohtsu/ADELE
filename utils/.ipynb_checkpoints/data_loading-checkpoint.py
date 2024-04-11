@@ -16,9 +16,10 @@ from pathlib import Path
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from osgeo import gdal
+import albumentations as album
 
 
-def load_image(filename, rand=None, cropsize=None, test=False):
+def load_image(filename, rand=None, cropsize=None):
     ext = splitext(filename)[1]
     if ext == '.npy':
         return Image.fromarray(np.load(filename))
@@ -27,25 +28,13 @@ def load_image(filename, rand=None, cropsize=None, test=False):
     elif ext == '.tif':
         if cropsize is not None:
             if rand is not None:
-                #raster = gdal.Open('./' + str(filename))
                 raster = gdal.Open(str(filename))
                 rows = raster.RasterXSize
                 cols = raster.RasterYSize
                 xoff = int((rows - cropsize) * rand[0])
                 yoff = int((cols - cropsize) * rand[1])
                 src = raster.ReadAsArray(xoff, yoff, cropsize, cropsize)
-            elif test == True:
-                raster = gdal.Open(str(filename))
-                rows = raster.RasterXSize
-                cols = raster.RasterYSize
-                src = []
-                for xoff in range(0, rows, cropsize):
-                    for yoff in range(0, rows, cropsize):
-                        #print(raster.ReadAsArray(xoff, yoff, cropsize, cropsize).dtype)
-                        src.append(raster.ReadAsArray(xoff, yoff, cropsize, cropsize))
-                src = np.array(src)
             else:
-                #raster = gdal.Open('./' + str(filename))
                 raster = gdal.Open(str(filename))
                 rows = raster.RasterXSize
                 cols = raster.RasterYSize
@@ -53,12 +42,8 @@ def load_image(filename, rand=None, cropsize=None, test=False):
                 yoff = rows // 2 - cropsize // 2
                 src = raster.ReadAsArray(xoff, yoff, cropsize, cropsize)
         else:
-            #src = gdal.Open('./' + str(filename)).ReadAsArray()
             src = gdal.Open(str(filename)).ReadAsArray()
         return src
-    #else:
-    #   return Image.open(filename)
-
 
 def unique_mask_values(idx, mask_dir, mask_suffix):
     mask_file = list(mask_dir.glob(idx + mask_suffix + '.tif'))[0]
@@ -71,14 +56,74 @@ def unique_mask_values(idx, mask_dir, mask_suffix):
         return np.unique(mask, axis=0)
     else:
         raise ValueError(f'Loaded masks should have 2 or 3 dimensions, found {mask.ndim}')
+        
+def get_training_augmentation():
+    train_transform = [
+        album.HorizontalFlip(p=0.5),
+        album.VerticalFlip(p=0.5),
+        album.RandomRotate90(p=0.5)
+    ]
+    return album.Compose(train_transform)
 
+def to_tensor(x, **kwargs):
+    return x.transpose(2, 0, 1).astype('float32')
+
+def get_preprocessing(preprocessing_fn=None):
+    """Construct preprocessing transform    
+    Args:
+        preprocessing_fn (callable): data normalization function 
+            (can be specific for each pretrained neural network)
+    Return:
+        transform: albumentations.Compose
+    """
+    _transform = []
+    if preprocessing_fn:
+        _transform.append(album.Lambda(image=preprocessing_fn))
+    _transform.append(album.Lambda(image=to_tensor, mask=to_tensor))
+        
+    return album.Compose(_transform)
+
+
+def one_hot_encode(label, label_values):
+    """
+    Convert a segmentation image label array to one-hot format
+    by replacing each pixel value with a vector of length num_classes
+    # Arguments
+        label: The 2D array segmentation image label
+        label_values
+        
+    # Returns
+        A 2D array with the same width and hieght as the input, but
+        with a depth size of num_classes
+    """
+    semantic_map = []
+    for colour in label_values:
+        equality = np.equal(label, colour[:, None, None])
+        class_map = np.all(equality, axis = 0)
+        semantic_map.append(class_map)
+    semantic_map = np.stack(semantic_map, axis=0)
+
+    return semantic_map
+
+def reverse_one_hot(image):
+    """
+    Transform a 2D array in one-hot format (depth is num_classes),
+    to a 2D array with only 1 channel, where each pixel value is
+    the classified class key.
+    # Arguments
+        image: The one-hot format image 
+        
+    # Returns
+        A 2D array with the same width and hieght as the input, but
+        with a depth size of 1, where each pixel value is the classified 
+        class key.
+    """
+    x = np.argmax(image, axis = 0)
 
 class BasicDataset(Dataset):
-    def __init__(self, images_dir: str, mask_dir: str, patch_size: int, scale: float = 1.0, mask_suffix: str = '', subset=None, val_per=None):
+    def __init__(self, images_dir: str, mask_dir: str, patch_size: int, mask_suffix: str = '', subset=None, val_per=None, preprocessing=None):
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
-        assert 0 < scale <= 1, 'Scale must be between 0 and 1'
-        self.scale = scale
         self.mask_suffix = mask_suffix
         self.subset = subset
         self.patchsize = patch_size
@@ -94,7 +139,13 @@ class BasicDataset(Dataset):
             self.ids = list(self.ids[:n_train])
         else:
             self.ids = list(self.ids[n_train:])
-        #self.ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
+        if self.subset == "train":
+            self.augmentation = get_training_augmentation()
+            # self.augmentation = None
+        else:
+            self.augmentation = None
+        self.preprocessing = get_preprocessing(preprocessing)
+
         if not self.ids:
             raise RuntimeError(f'No input file found in {images_dir}, make sure you put your images there')
         
@@ -107,20 +158,6 @@ class BasicDataset(Dataset):
             ))
 
         self.mask_values = list(sorted(np.unique(np.concatenate(unique), axis=0).tolist()))
-        if self.subset == "Train":
-            self.transforms = Compose([
-                IdentityTrans(),
-                #RandomHorizontalFlip(0.5),
-                #RandomVerticalFlip(0.5),
-                #RandomRotation(0.5),
-                #Normalize((0, 0, 0), (1, 1, 1)),
-            ])
-        else:
-            self.transforms = Compose([
-                IdentityTrans(),
-                #CenterCrop(patch_size),
-                #Normalize((0, 0, 0), (1, 1, 1)),
-            ])
 
         logging.info(f'Unique mask values: {self.mask_values}')
 
@@ -130,26 +167,12 @@ class BasicDataset(Dataset):
 
     @staticmethod
     #def preprocess(mask_values, pil_img, scale, is_mask):
-    def preprocess(mask_values, img, scale, is_mask):
-        #w, h = pil_img.size
-        #newW, newH = int(scale * w), int(scale * h)
-        #assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
-        #pil_img = pil_img.resize((newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
-        #img = np.asarray(pil_img)
-        #img = pil_img
-        #newH = 256
-        #newW = 256
+    def preprocess(mask_values, img, is_mask):
         H = img.shape[-1]
         W = img.shape[-2]
         
         if is_mask:
-            #mask = np.zeros((newH, newW), dtype=np.int64)
             mask = np.zeros((H, W), dtype=np.int64)
-            #for i, v in enumerate(mask_values):
-                #if img.ndim == 2:
-                #    mask[img == v] = i
-                #else:
-                #    mask[(img == v).all(-1)] = i
             for v in mask_values:
                 if img.ndim == 2:
                     if v < 21:
@@ -189,46 +212,48 @@ class BasicDataset(Dataset):
         name = self.ids[idx]
         mask_file = list(self.mask_dir.glob(name + self.mask_suffix + '.tif'))
         img_file = list(self.images_dir.glob(name + '.tif'))
-        #mask_file = list(self.mask_dir.glob(name + self.mask_suffix + '.*'))
-        #img_file = list(self.images_dir.glob(name + '.*'))
 
         assert len(img_file) == 1, f'Either no image or multiple images found for the ID {name}: {img_file}'
         assert len(mask_file) == 1, f'Either no mask or multiple masks found for the ID {name}: {mask_file}'
-        # mask = load_image(mask_file[0])
-        # img = load_image(img_file[0])
         if self.subset == "Train":
             rand = [random.random(), random.random()]
             mask = load_image(mask_file[0], rand=rand, cropsize=self.patchsize)
             img = load_image(img_file[0], rand=rand, cropsize=self.patchsize)
-        elif self.subset == "Test":
-            mask = load_image(mask_file[0], rand=None, cropsize=self.patchsize, test=True)
-            img = load_image(img_file[0], rand=None, cropsize=self.patchsize, test=True)
         else:
             mask = load_image(mask_file[0], rand=None, cropsize=self.patchsize)
             img = load_image(img_file[0], rand=None, cropsize=self.patchsize)
-        
+
         assert img.shape[-1] * img.shape[-2] == mask.shape[-1] * mask.shape[-2], \
             f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
-        #assert img.size == mask.size, \
-        #    f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
-        
-        if self.subset == 'Test':
-            for i in range(img.shape[0]):
-                img = img.astype('float64') 
-                img[i, :, :, :] = self.preprocess(self.mask_values, img[i, :, :, :], self.scale, is_mask=False)
-                mask[i, :, :] = self.preprocess(self.mask_values, mask[i, :, :], self.scale, is_mask=True)
-        else:
-            img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
-            mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
-        
+
+        img = self.preprocess(self.mask_values, img, is_mask=False)
+        mask = self.preprocess(self.mask_values, mask, is_mask=True)
+
+        # one-hot-encode the mask
+        num_categories = 5
+        mask = np.eye(num_categories)[mask].astype('float').transpose(2, 0, 1)
+
+        img = img.transpose(1, 2, 0)
+        mask = mask.transpose(1, 2, 0)
+
+        # apply augmentations
+        if self.augmentation:
+            sample = self.augmentation(image=img, mask=mask)
+            img, mask = sample['image'], sample['mask']
+
+        if self.preprocessing:
+            sample = self.preprocessing(image=img, mask=mask)
+            img, mask = sample['image'], sample['mask']
+
+        # reverse one-hot-encoding
+        mask = np.argmax(mask, axis = 0)
+
         img = torch.as_tensor(img.copy()).float().contiguous()
         mask = torch.as_tensor(mask.copy()).long().contiguous()
-        
-        img, mask = self.transforms(img, mask)
-        
+
         return {
             'image': img,
-            'mask': mask,
+            'mask': mask
         }
             
     #def update_allclass(self, idx, IoU_npl_indx, mask_threshold, IoU_npl_constraint, class_constraint=True, update_or_mask='update', update_all_bg_img=False):
@@ -236,41 +261,20 @@ class BasicDataset(Dataset):
         #seg_label = self.seg_dict[idx].unsqueeze(0)  # 1,h,w
         b, h, w = seg_label.size()  # b,h,w
 
-        # if seg label does not belong to the set of class that needs to be updated (exclude the background class), return
-        #if set(np.unique(seg_label.numpy())).isdisjoint(set(IoU_npl_indx[1:])):
-            # only the background in the pseudo label
-            # if update_all_bg_img and len(np.unique(seg_label.numpy()))==1 and np.unique(seg_label.numpy())[0]==0:
-            #if update_all_bg_img and not (set(np.unique(seg_label.numpy())) == set([])):
-            #    pass
-            #else:
-            #    return
-        
-        #seg_argmax, seg_prediction_max_prob = self.prev_pred_dict[idx]
-        #seg_argmax = seg_argmax
-        #seg_prediction_max_prob = seg_prediction_max_prob
-
         # if the class_constraint==True and seg label has foreground class
         # we prevent using predicted class that is not in the pseudo label to correct the label
         if class_constraint == True and (set(np.unique(seg_label.numpy())) == set([])):
             for i_batch in range(b):
                 unique_class = torch.unique(seg_label[i_batch])
-                # print(unique_class)
                 indx = torch.zeros((h, w), dtype=torch.long)
                 for element in unique_class:
                     indx = indx | (seg_argmax[i_batch] == element)
                 seg_argmax[i_batch][(indx == 0)] = 255
-
         seg_mask_255 = (seg_argmax == 255)
-
-        # seg_change_indx means which pixels need to be updated,
-        # find index where prediction is different from label,
-        # and  it is not a ignored index and confidence is larger than threshold
+        
         seg_change_indx = (seg_label != seg_argmax) & (~seg_mask_255) & (
                 seg_prediction_max_prob > mask_threshold)
 
-        # when set to "both", only when predicted class and pseudo label both existed in the set, the label would be corrected
-        # this is a conservative way, during our whole experiments, IoU_npl_constraint is always set to be "single",
-        # this is retained here in case user may find in useful for their dataset
         if IoU_npl_constraint == 'both':
             class_indx_seg_argmax = torch.zeros((b, h, w), dtype=torch.bool)
             class_indx_seg_label = torch.zeros((b, h, w), dtype=torch.bool)
@@ -280,20 +284,12 @@ class BasicDataset(Dataset):
                 class_indx_seg_label = class_indx_seg_label | (seg_label == element)
             seg_change_indx = seg_change_indx & class_indx_seg_label & class_indx_seg_argmax
 
-        #  when set to "single", when predicted class existed in the set, the label would be corrected, no need to consider pseudo label
-        # e.g. when person belongs to the set, motor pixels in the pseudo label can be updated to person even if motor is not in set
         elif IoU_npl_constraint == 'single':
             class_indx_seg_argmax = torch.zeros((b, h, w), dtype=torch.bool)
 
             for element in IoU_npl_indx:
                 class_indx_seg_argmax = class_indx_seg_argmax | (seg_argmax == element)
             seg_change_indx = seg_change_indx & class_indx_seg_argmax
-
-        # if the foreground class portion is too small, do not update
-        # seg_label_clone = seg_label.clone()
-        # seg_label_clone[seg_change_indx] = seg_argmax[seg_change_indx]
-        # if torch.sum(seg_label_clone!=0) < 0.5 * torch.sum(seg_label!=0) and torch.sum(seg_label_clone==0)/(b*h*w)>0.95:
-        #     return
 
         # update or mask 255
         if update_or_mask == 'update':
@@ -303,7 +299,6 @@ class BasicDataset(Dataset):
             seg_label[seg_change_indx] = (torch.ones((b, h, w), dtype=torch.long) * 255)[
                 seg_change_indx]  # the updated pseudo label
         return seg_label
-        #self.seg_dict[idx] = seg_label.squeeze()
 
 
 class CarvanaDataset(BasicDataset):

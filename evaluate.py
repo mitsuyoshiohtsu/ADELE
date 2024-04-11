@@ -28,8 +28,8 @@ def evaluate(net, dataloader, device, amp, tta=False, post_p=False, last=False):
             mask_true = mask_true.to(device=device, dtype=torch.long)
 
             # predict the mask
-            #mask_pred = net(image)
-            mask_pred = net(image)['out']
+            mask_pred = net(image)
+            #mask_pred = net(image)['out']
             
             if tta == True:
                 from torchvision.transforms import functional as T
