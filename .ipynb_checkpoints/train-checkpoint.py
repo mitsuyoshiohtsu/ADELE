@@ -54,8 +54,7 @@ def derivation(x, a, b, c):
 def label_update_epoch(ydata_fit, threshold=0.9, eval_interval=100, num_iter_per_epoch=522 / 8):
     xdata_fit = np.linspace(0, len(ydata_fit) - 1, len(ydata_fit))
     a, b, c = fit(curve_func, xdata_fit, ydata_fit)
-    #epoch = np.arange(1, 16)
-    epoch = np.arange(1, 80)
+    epoch = np.arange(1, 60)
     #y_hat = curve_func(epoch, a, b, c)
     relative_change = abs(abs(derivation(epoch, a, b, c)) - abs(derivation(1, a, b, c))) / abs(derivation(1, a, b, c))
     relative_change[relative_change > 1] = 0
@@ -175,7 +174,8 @@ def train_model(
                     pred_torch = torch.argmax(masks_pred, dim=1).detach() # b, h, w
                     pred_np = pred_torch.cpu().numpy() # b, h, w
                     gt_np = true_masks.detach().cpu().numpy()
-                    pseudo_masks = train_loader.dataset.update_allclass(IoU_npl_indx, true_masks.cpu(), pred_torch.cpu(), masks_pred.cpu().max(1)[0])
+                    #pseudo_masks = train_loader.dataset.update_allclass(IoU_npl_indx, true_masks.cpu(), pred_torch.cpu(), masks_pred.cpu().max(1)[0])
+                    pseudo_masks = train_loader.dataset.update_allclass(IoU_npl_indx, true_masks.cpu(), pred_torch.cpu(), masks_pred.cpu().max(1)[0], IoU_npl_constraint = 'both')
                     
                     loss = criterion_1(masks_pred, pseudo_masks.to(device))
                     loss += criterion_2(
@@ -289,7 +289,7 @@ def get_args():
                         help="threshold to select the mask, ")
     parser.add_argument('--update_interval', type=int, default=1,
                         help="evaluate the prediction every 1 epoch")
-    parser.add_argument('--r_threshold', type=float, default=0.98,
+    parser.add_argument('--r_threshold', type=float, default=0.95,
                         help="the r threshold to decide if_update")
     parser.add_argument('--mask_threshold', type=float, default=0.90,
                         help="only the region with high probability and disagree with Pseudo label be updated")
